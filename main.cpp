@@ -25,13 +25,17 @@
 #include "trace_helper.h"
 #include "lora_radio_helper.h"
 
+#include "MulticastControlPackage.h"
+#include "ClockSyncControlPackage.h"
+#include "FragmentationControlPackage.h"
+
 using namespace events;
 
 // Max payload size can be LORAMAC_PHY_MAXPAYLOAD.
 // This example only communicates with much shorter messages (<30 bytes).
 // If longer messages are used, these buffers must be changed accordingly.
-uint8_t tx_buffer[30];
-uint8_t rx_buffer[30];
+uint8_t tx_buffer[100];
+uint8_t rx_buffer[100];
 
 /*
  * Sets up an application dependent transmission timer in ms. Used only when Duty Cycling is off for testing
@@ -77,15 +81,144 @@ static EventQueue ev_queue(MAX_NUMBER_OF_EVENTS * EVENTS_EVENT_SIZE);
  */
 static void lora_event_handler(lorawan_event_t event);
 
+static frag_bd_opts_t *bd_cb_handler(uint8_t frag_index, uint32_t desc);
+
 /**
  * Constructing Mbed LoRaWANInterface and passing it down the radio object.
  */
 static LoRaWANInterface lorawan(radio);
+static ClockSyncControlPackage clk_sync_plugin;
+static MulticastControlPackage mcast_plugin;
+static FragmentationControlPackage frag_plugin;
+uint8_t gen_app_key[16] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
+                           0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x1F};
+mcast_controller_cbs_t mcast_cbs;
+clk_sync_response_t *sync_resp = NULL;
+mcast_ctrl_response_t *mcast_resp = NULL;
+frag_ctrl_response_t *frag_resp = NULL;
 
 /**
  * Application specific callbacks
  */
 static lorawan_app_callbacks_t callbacks;
+int app_mssage_dispatcher_id = -1;
+bool clock_sync_request_ongoing = false;
+bool clock_sync_magic_test_ongoing = false;
+bool clock_sync_test_ongoing = false;
+bool class_c_mode = false;
+
+static int start_message_dispatcher(void);
+static int stop_message_dispatcher(int id);
+static void send_message();
+static void test_state_machine(uint8_t new_state);
+typedef enum {
+    IDLE=0,
+    CLOCK_SYNC_REQ,
+    CLOCK_SYNC_MAGIC_TEST,
+    SENDING_CLOCK_SYNC_MAGIC_TEST_RESP,
+    MCAST_MAGIC_TEST,
+    SENDING_MCAST_MAGIC_TEST_RESP,
+    FRAG_MAGIC_TEST,
+    SENDING_FRAG_MAGIC_TEST_RESP,
+    NORMAL_TRAFFIC
+} state;
+
+static uint8_t previous_state = IDLE;
+static BlockDevice *mem;
+static FragBDWrapper *flash;
+static frag_bd_opts_t bd_opts;
+
+static frag_bd_opts_t *bd_cb_handler(uint8_t frag_index, uint32_t desc)
+{
+    printf("Creating BD for session %d with desc: %lu", frag_index, desc);
+    bd_opts.redundancy_max = 40;
+    bd_opts.offset = 0;
+    bd_opts.fasm = new FragAssembler();
+    mem = new HeapBlockDevice(2 * 512, 512);
+    flash = new FragBDWrapper(mem);
+    bd_opts.bd = flash;
+
+    return &bd_opts;
+}
+
+static void switch_to_class_A_helper()
+{
+    printf("\r\n Class C session life time expired \r\n");
+    lorawan.enable_adaptive_datarate();
+    printf("\r\n ADR enabled \r\n");
+    lorawan.restore_rx2_frequency();
+    printf("\r\n Restoring RX2 frequency to default \r\n");
+    printf("\r\n Restoring class A session \r\n");
+    lorawan.set_device_class(CLASS_A);
+
+    class_c_mode = false;
+
+    test_state_machine(FRAG_MAGIC_TEST);
+
+/*    if (app_mssage_dispatcher_id == -1) {
+        app_mssage_dispatcher_id = start_message_dispatcher();
+    }*/
+
+}
+
+static void switch_to_class_C_helper(uint8_t life_time,
+                                     uint8_t dr,
+                                     uint32_t dl_freq)
+{
+    lorawan.cancel_sending();
+    lorawan.disable_adaptive_datarate();
+    if (lorawan.set_datarate(dr) != LORAWAN_STATUS_OK) {
+        printf("\r\n Failed to set up data rate %d for Class C session \r\n", dr);
+    } else {
+        printf("\r\n Class C session data rate: %d \r\n", dr);
+    }
+
+    if (lorawan.set_rx2_freuency(dl_freq) != LORAWAN_STATUS_OK) {
+        printf("\r\n Failed to set up frequency %lu for Class C session \r\n", dl_freq);
+    } else {
+        printf("\r\n Class C session frequency: %lu \r\n", dl_freq);
+    }
+
+    lorawan.set_device_class(CLASS_C);
+
+    ev_queue.call_in(life_time * 1000, switch_to_class_A_helper);
+}
+
+static void switch_class(uint8_t device_class,
+                         uint32_t time_to_switch,
+                         uint8_t life_time,
+                         uint8_t dr,
+                         uint32_t dl_freq)
+{
+    if (device_class != CLASS_C) {
+        return;
+    }
+
+    class_c_mode = true;
+    app_mssage_dispatcher_id = stop_message_dispatcher(app_mssage_dispatcher_id);
+    printf("\r\n Switching to class C in %lu seconds \r\n", time_to_switch);
+    printf("\r\n Class C session lifetime %d seconds \r\n", life_time);
+    ev_queue.call_in(time_to_switch * 1000, switch_to_class_C_helper, life_time, dr, dl_freq);
+
+}
+
+static lorawan_status_t check_params_validity(uint8_t dr, uint32_t dl_freq)
+{
+    return lorawan.verify_multicast_freq_and_dr(dl_freq, dr);
+}
+static int start_message_dispatcher(void) {
+    // send a message every 10 secs
+    return ev_queue.call_every(TX_TIMER, send_message);
+}
+
+static int stop_message_dispatcher(int id) {
+    ev_queue.cancel(id);
+    return -1;
+}
+
+static const uint32_t magic_sequence_clk_sync = 0x01010101;
+static const uint32_t magic_sequence_mcast = 0x02020202;
+static const uint32_t magic_sequence_frag = 0x03030303;
 
 /**
  * Entry point for application
@@ -94,6 +227,19 @@ int main (void)
 {
     // setup tracing
     setup_trace();
+
+    // activate multicast plugin
+    mcast_plugin.activate_multicast_control_package(gen_app_key, 16);
+
+    //set callbacks for multicast control package
+    mcast_cbs.switch_class = mbed::callback(switch_class);
+    mcast_cbs.check_params_validity = mbed::callback(check_params_validity);
+
+    int r = frag_plugin.activate_frag_subsystem(callback(bd_cb_handler), lorawan.get_multicast_addr_register());
+
+    if (r != 0) {
+        printf("\r\n Couldn't activate Frag subsystem \r\n");
+    }
 
     // stores the status of a call to LoRaWAN protocol
     lorawan_status_t retcode;
@@ -145,6 +291,139 @@ int main (void)
     return 0;
 }
 
+static void test_state_machine(uint8_t new_state)
+{
+    if (new_state == IDLE || new_state == previous_state) {
+        return;
+    }
+
+    switch (new_state) {
+        case CLOCK_SYNC_REQ: {
+            sync_resp = clk_sync_plugin.request_clock_sync(true);
+
+            if (sync_resp) {
+                clock_sync_request_ongoing = true;
+                lorawan.send(CLOCK_SYNC_PORT, sync_resp->data, sync_resp->size,
+                MSG_UNCONFIRMED_FLAG);
+            }
+
+            break;
+        }
+
+        case CLOCK_SYNC_MAGIC_TEST: {
+            write_four_bytes(magic_sequence_clk_sync, tx_buffer);
+            int16_t ret = lorawan.send(
+                    MBED_CONF_LORA_APP_PORT,
+                    tx_buffer,
+                    4,
+                    MSG_UNCONFIRMED_FLAG);
+            if (ret == 4) {
+                printf("\r\n Sent Magic Sequence for clock sync test \r\n");
+                for (int i = 0; i < 4; i++) {
+                    printf("%x", tx_buffer[i]);
+                }
+                printf("\r\n");
+            }
+
+            sync_resp = NULL;
+
+            break;
+        }
+
+        case SENDING_CLOCK_SYNC_MAGIC_TEST_RESP: {
+            if (sync_resp) {
+                printf("\r\n sync_resp->data: ");
+                for (int i = 0; i < sync_resp->size; i++) {
+                      printf("%x", sync_resp->data[i]);
+                }
+                printf("\r\n sync_resp->size: %d \r\n", sync_resp->size);
+                lorawan.send(CLOCK_SYNC_PORT, sync_resp->data, sync_resp->size,
+                             MSG_UNCONFIRMED_FLAG);
+            }
+            break;
+        }
+
+        case MCAST_MAGIC_TEST: {
+            write_four_bytes(magic_sequence_mcast, tx_buffer);
+            int16_t ret = lorawan.send(MBED_CONF_LORA_APP_PORT, tx_buffer, 4,
+                                       MSG_UNCONFIRMED_FLAG);
+            if (ret == 4) {
+                printf("\r\n Sent Magic Sequence for Multicast test \r\n");
+                for (int i = 0; i < 4; i++) {
+                    printf("%x", tx_buffer[i]);
+                }
+                printf("\r\n");
+            }
+
+            sync_resp = NULL;
+            mcast_resp = NULL;
+
+            break;
+        }
+
+        case SENDING_MCAST_MAGIC_TEST_RESP: {
+            if (mcast_resp) {
+                printf("\r\n mcast_resp->data: ");
+                for (int i = 0; i < mcast_resp->size; i++) {
+                    printf("%x", mcast_resp->data[i]);
+                }
+                printf("\r\n mcast_resp->size: %d \r\n", mcast_resp->size);
+
+                lorawan.send(MULTICAST_CONTROL_PORT,
+                             mcast_resp->data,
+                             mcast_resp->size,
+                             MSG_UNCONFIRMED_FLAG);
+            }
+            mcast_resp = NULL;
+            break;
+        }
+
+        case FRAG_MAGIC_TEST: {
+            write_four_bytes(magic_sequence_frag, tx_buffer);
+            int16_t ret = lorawan.send(MBED_CONF_LORA_APP_PORT, tx_buffer, 4,
+                                       MSG_UNCONFIRMED_FLAG);
+            if (ret == 4) {
+                printf("\r\n Sent Magic Sequence for Frag test \r\n");
+                for (int i = 0; i < 4; i++) {
+                    printf("%x", tx_buffer[i]);
+                }
+                printf("\r\n");
+            }
+
+            frag_resp = NULL;
+            break;
+        }
+
+        case SENDING_FRAG_MAGIC_TEST_RESP: {
+
+            if (frag_resp && frag_resp->type == FRAG_CMD_RESP) {
+
+                printf("\r\n frag_resp->data: ");
+                for (int i = 0; i < frag_resp->cmd_ans.size; i++) {
+                    printf("%x", frag_resp->cmd_ans.data[i]);
+                }
+                printf("\r\n frag_resp->cmd_ans.size: %d \r\n",
+                       frag_resp->cmd_ans.size);
+
+                lorawan.send(FRAGMENTATION_CONTROL_PORT, frag_resp->cmd_ans.data,
+                             frag_resp->cmd_ans.size,
+                             MSG_UNCONFIRMED_FLAG);
+
+            }
+
+            frag_resp = NULL;
+            break;
+        }
+
+        default:
+            new_state = IDLE;
+            break;
+    }
+
+    previous_state = new_state;
+
+}
+
 /**
  * Sends a message to the Network Server
  */
@@ -165,14 +444,15 @@ static void send_message()
     }
 
     packet_len = sprintf((char*) tx_buffer, "Dummy Sensor Value is %3.1f",
-                    sensor_value);
+                         sensor_value);
 
     retcode = lorawan.send(MBED_CONF_LORA_APP_PORT, tx_buffer, packet_len,
-                           MSG_CONFIRMED_FLAG);
+    MSG_CONFIRMED_FLAG);
 
     if (retcode < 0) {
-        retcode == LORAWAN_STATUS_WOULD_BLOCK ? printf("send - WOULD BLOCK\r\n")
-                : printf("\r\n send() - Error code %d \r\n", retcode);
+        retcode == LORAWAN_STATUS_WOULD_BLOCK ?
+                printf("send - WOULD BLOCK\r\n") :
+                printf("\r\n send() - Error code %d \r\n", retcode);
 
         if (retcode == LORAWAN_STATUS_WOULD_BLOCK) {
             //retry in 3 seconds
@@ -185,6 +465,7 @@ static void send_message()
 
     printf("\r\n %d bytes scheduled for transmission \r\n", retcode);
     memset(tx_buffer, 0, sizeof(tx_buffer));
+
 }
 
 /**
@@ -193,9 +474,10 @@ static void send_message()
 static void receive_message()
 {
     int16_t retcode;
-    retcode = lorawan.receive(MBED_CONF_LORA_APP_PORT, rx_buffer,
-                              sizeof(rx_buffer),
-                              MSG_CONFIRMED_FLAG|MSG_UNCONFIRMED_FLAG);
+    int flags;
+    uint8_t port;
+    retcode = lorawan.receive(rx_buffer,
+                              sizeof(rx_buffer), port, flags);
 
     if (retcode < 0) {
         printf("\r\n receive() - Error code %d \r\n", retcode);
@@ -210,6 +492,19 @@ static void receive_message()
 
     printf("\r\n Data Length: %d\r\n", retcode);
 
+    if (port == CLOCK_SYNC_PORT) {
+        sync_resp = clk_sync_plugin.parse(rx_buffer, retcode);
+    } else if (port == MULTICAST_CONTROL_PORT) {
+        mcast_resp = mcast_plugin.parse(rx_buffer, retcode,
+                                        lorawan.get_multicast_addr_register(),
+                                        &mcast_cbs);
+    } else if (port == FRAGMENTATION_CONTROL_PORT) {
+        lorawan_rx_metadata md;
+        lorawan.get_rx_metadata(md);
+        // Descriptor 'FOTA' = 0x464f5441
+        frag_resp = frag_plugin.parse(rx_buffer, retcode, flags, md.dev_addr, 0x464f5441);
+    }
+
     memset(rx_buffer, 0, sizeof(rx_buffer));
 }
 
@@ -221,12 +516,7 @@ static void lora_event_handler(lorawan_event_t event)
     switch (event) {
         case CONNECTED:
             printf("\r\n Connection - Successful \r\n");
-            if (MBED_CONF_LORA_DUTY_CYCLE_ON) {
-                send_message();
-            } else {
-                ev_queue.call_every(TX_TIMER, send_message);
-            }
-
+            test_state_machine(CLOCK_SYNC_REQ);
             break;
         case DISCONNECTED:
             ev_queue.break_dispatch();
@@ -234,8 +524,8 @@ static void lora_event_handler(lorawan_event_t event)
             break;
         case TX_DONE:
             printf("\r\n Message Sent to Network Server \r\n");
-            if (MBED_CONF_LORA_DUTY_CYCLE_ON) {
-                send_message();
+            if (app_mssage_dispatcher_id == -1 && class_c_mode == false) {
+                app_mssage_dispatcher_id = start_message_dispatcher();
             }
             break;
         case TX_TIMEOUT:
@@ -243,14 +533,16 @@ static void lora_event_handler(lorawan_event_t event)
         case TX_CRYPTO_ERROR:
         case TX_SCHEDULING_ERROR:
             printf("\r\n Transmission Error - EventCode = %d \r\n", event);
-            // try again
-            if (MBED_CONF_LORA_DUTY_CYCLE_ON) {
-                send_message();
-            }
             break;
         case RX_DONE:
             printf("\r\n Received message from Network Server \r\n");
             receive_message();
+            if (app_mssage_dispatcher_id > 0) {
+                app_mssage_dispatcher_id = stop_message_dispatcher(app_mssage_dispatcher_id);
+            }
+
+            previous_state == SENDING_MCAST_MAGIC_TEST_RESP ? test_state_machine(FRAG_MAGIC_TEST)
+                    : test_state_machine(previous_state + 1);
             break;
         case RX_TIMEOUT:
         case RX_ERROR:
@@ -261,9 +553,6 @@ static void lora_event_handler(lorawan_event_t event)
             break;
         case UPLINK_REQUIRED:
             printf("\r\n Uplink required by NS \r\n");
-            if (MBED_CONF_LORA_DUTY_CYCLE_ON) {
-                send_message();
-            }
             break;
         default:
             MBED_ASSERT("Unknown Event");
